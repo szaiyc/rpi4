@@ -1,184 +1,69 @@
-name: 构建集成KernelSU的树莓派4内核
+name: 构建树莓派4 Android系统集成KernelSU
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      kernel_version:
-        description: '内核版本标签'
-        required: true
-        default: '5.15.0'
-      kernelsu_version:
-        description: 'KernelSU版本'
-        required: true
-        default: 'main'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison python3 gcc-aarch64-linux-gnu ccache
-          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev gcc-multilib g++-multilib
-
-      - name: 设置缓存
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-ccache-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-ccache-
-
-      - name: 配置ccache
-        run: |
-          mkdir -p ~/.ccache
-          echo "max_size = 5G" > ~/.ccache/ccache.conf
-          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
-
-      - name: 克隆KernelSU
-        run: |
-          git clone --depth=1 https://github.com/tiann/KernelSU -b ${{ github.event.inputs.kernelsu_version }}
-          echo "KernelSU版本: $(cd KernelSU && git rev-parse --short HEAD)"
-
-      - name: 查找内核配置文件
-        id: find_config
-        run: |
-          # 查找所有可能的配置文件
-          CONFIG_FILES=$(find arch/arm64/configs/ -name "*defconfig" -type f 2>/dev/null || echo "")
-          if [ -z "$CONFIG_FILES" ]; then
-            echo "错误：找不到内核配置文件！"
-            exit 1
-          fi
-          
-          # 优先选择以下配置文件（按优先级排序）
-          for PATTERN in "bcm2711" "rpi4" "rpi"; do
-            for CONFIG in $CONFIG_FILES; do
-              if echo "$CONFIG" | grep -i "$PATTERN" > /dev/null; then
-                echo "找到配置文件: $CONFIG"
-                echo "config_file=$CONFIG" >> $GITHUB_OUTPUT
-                break 2
-              fi
-            done
-          done
-          
-          # 如果没有找到匹配的，使用第一个找到的配置文件
-          if [ -z "$(echo "$GITHUB_OUTPUT" | grep config_file)" ]; then
-            CONFIG=$(echo "$CONFIG_FILES" | head -n1)
-            echo "使用默认配置文件: $CONFIG"
-            echo "config_file=$CONFIG" >> $GITHUB_OUTPUT
-          fi
-          
-          # 显示找到的所有配置文件
-          echo "所有可用的配置文件:"
-          echo "$CONFIG_FILES"
-
-      - name: 设置内核配置
-        run: |
-          CONFIG_FILE="${{ steps.find_config.outputs.config_file }}"
-          echo "使用配置文件: $CONFIG_FILE"
-          
-          # 启用KernelSU所需的配置
-          cat >> $CONFIG_FILE << EOF
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBES_ON_FTRACE=y
-          # KernelSU所需选项
-          CONFIG_MODULES=y
-          CONFIG_OVERLAY_FS=y
-          EOF
-          
-          # 在Makefile中集成KernelSU
-          sed -i '/^EXTRAVERSION =/a\\n# KernelSU\ninclude $(srctree)/KernelSU/kernel/ksu.mk' Makefile
-
-      - name: 修改内核初始化代码
-        run: |
-          # 修改init/main.c，添加KernelSU初始化
-          grep -q "ksu_kernel_init" init/main.c || cat >> init/main.c << EOF
-          
-          // KernelSU初始化
-          extern int ksu_kernel_init(void);
-          
-          static int __init ksu_module_init(void)
-          {
-              pr_info("KernelSU模块初始化\\n");
-              ksu_kernel_init();
-              return 0;
-          }
-          
-          late_initcall(ksu_module_init);
-          EOF
-
-      - name: 编译内核
-        run: |
-          mkdir -p out
-          
-          # 获取配置文件名（不含路径）
-          CONFIG_NAME=$(basename ${{ steps.find_config.outputs.config_file }})
-          
-          # 配置内核
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ${CONFIG_NAME%.defconfig}_defconfig
-          
-          # 编译内核
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
-          
-          # 创建输出目录
-          mkdir -p release/boot/overlays
-          
-          # 复制内核和设备树
-          cp out/arch/arm64/boot/Image release/boot/kernel8.img || cp out/arch/arm64/boot/Image.gz release/boot/kernel8.img
-          cp out/arch/arm64/boot/dts/broadcom/*.dtb release/boot/ || echo "没有找到broadcom目录下的DTB文件"
-          cp out/arch/arm64/boot/dts/overlays/*.dtb* release/boot/overlays/ || echo "没有找到overlays目录下的DTB文件"
-          cp out/arch/arm64/boot/dts/overlays/README release/boot/overlays/ || echo "没有找到README文件"
-
-      - name: 打包模块
-        run: |
-          # 安装模块
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=release modules_install
-          
-          # 打包模块为zip文件
-          cd release
-          find . -type f -name "*.ko" -exec aarch64-linux-gnu-strip --strip-unneeded {} \; || echo "没有找到内核模块或strip失败"
-          zip -r ../rpi4-kernelsu-modules.zip lib/modules || echo "打包模块失败，可能没有模块生成"
-          cd ..
-
-      - name: 创建内核包
-        run: |
-          # 打包内核文件
-          cd release
-          zip -r ../rpi4-kernelsu-kernel.zip boot
-          cd ..
-          
-          # 合并为完整包
-          zip -r rpi4-kernelsu-${{ github.event.inputs.kernel_version }}.zip rpi4-kernelsu-kernel.zip rpi4-kernelsu-modules.zip
-          
-          # 创建版本说明
-          echo "树莓派4 集成KernelSU内核 - 版本 ${{ github.event.inputs.kernel_version }}" > release_notes.txt
-          echo "KernelSU版本: $(cd KernelSU && git rev-parse --short HEAD)" >> release_notes.txt
-          echo "编译时间: $(date)" >> release_notes.txt
-          echo "使用配置文件: ${{ steps.find_config.outputs.config_file }}" >> release_notes.txt
-
-      - name: 上传内核构建产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpi4-kernelsu-${{ github.event.inputs.kernel_version }}
-          path: |
-            rpi4-kernelsu-${{ github.event.inputs.kernel_version }}.zip
-            release_notes.txt
-
-      - name: 创建GitHub发布
-        uses: softprops/action-gh-release@v1
-        if: github.event_name == 'workflow_dispatch'
-        with:
-          files: |
-            rpi4-kernelsu-${{ github.event.inputs.kernel_version }}.zip
-            release_notes.txt
-          name: 树莓派4 KernelSU ${{ github.event.inputs.kernel_version }}
-          tag_name: ksu-${{ github.event.inputs.kernel_version }}
-          body_path: release_notes.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: 检出代码
+      uses: actions/checkout@v4
+      
+    - name: 设置环境
+      run: |
+        sudo apt update
+        sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+        gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
+        libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig
+        
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        export PATH=~/bin:$PATH
+        
+    - name: 初始化Repo
+      run: |
+        mkdir -p ~/android-rpi
+        cd ~/android-rpi
+        repo init -u https://android.googlesource.com/platform/manifest -b android-13.0.0_r8
+        git clone https://github.com/raspberry-vanilla/android_local_manifest .repo/local_manifests
+        
+    - name: 同步源代码
+      run: |
+        cd ~/android-rpi
+        repo sync -j$(nproc)
+        
+    - name: 集成KernelSU
+      run: |
+        cd ~/android-rpi/kernel/brcm/rpi
+        git submodule add https://github.com/tiann/KernelSU KernelSU
+        
+        # 修改Makefile添加KernelSU支持
+        echo '# KernelSU' >> Makefile
+        echo 'export KERNELSU_TAG=main' >> Makefile
+        echo 'export KERNELSU_PATH=$(srctree)/KernelSU' >> Makefile
+        echo '-include $(KERNELSU_PATH)/kernel/setup.mk' >> Makefile
+        
+        # 修改内核配置
+        echo 'CONFIG_KPROBES=y' >> arch/arm64/configs/bcm2711_defconfig
+        echo 'CONFIG_HAVE_KPROBES=y' >> arch/arm64/configs/bcm2711_defconfig
+        echo 'CONFIG_KPROBE_EVENTS=y' >> arch/arm64/configs/bcm2711_defconfig
+        
+    - name: 编译系统
+      run: |
+        cd ~/android-rpi
+        source build/envsetup.sh
+        lunch rpi4-userdebug
+        make bootimage -j$(nproc)
+        make -j$(nproc)
+        
+    - name: 上传构建结果
+      uses: actions/upload-artifact@v4
+      with:
+        name: rpi4-android-kernelsu
+        path: ~/android-rpi/out/target/product/rpi4/
