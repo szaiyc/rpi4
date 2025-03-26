@@ -1,201 +1,52 @@
-name: Build Raspberry Pi 4 KernelSU
+name: 构建带KernelSU的树莓派内核
 
 on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      ANDROID_BRANCH:
-        description: 'Android分支'
-        required: true
-        default: 'master'  # 修改为默认分支
-        type: choice
-        options:
-          - 'master'
-          - 'lineage-19.1'
-          - 'lineage-18.1'
-      KERNELSU_VERSION:
-        description: 'KernelSU版本'
-        required: true
-        default: 'v0.9.5'
-        type: choice
-        options:
-          - 'v0.9.5'
-          - 'v0.6.7'
-          - 'v0.5.2'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      DEVICE_PATH: android_device_brcm_rpi4
-      KERNEL_PATH: android_kernel_brcm_rpi
-      ARCH: arm64
-
     steps:
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi \
-            binutils-aarch64-linux-gnu \
-            binutils-arm-linux-gnueabi \
-            make \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            ccache \
-            kmod \
-            cpio \
-            build-essential \
-            zip \
-            curl \
-            zlib1g-dev \
-            libncurses5-dev \
-            git \
-            python3 \
-            python3-pip \
-            device-tree-compiler \
-            abootimg
-
-      - name: Set Date
-        id: date
-        run: echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
-
-      - name: Check Repository Branches
-        run: |
-          echo "🔍 检查设备仓库可用分支..."
-          git ls-remote --heads https://github.com/raspberry-vanilla/android_device_brcm_rpi4 | grep -oE 'refs/heads/[^/]+' | sed 's#refs/heads/##'
-          
-          echo "🔍 检查内核仓库可用分支..."
-          git ls-remote --heads https://github.com/raspberry-vanilla/android_kernel_brcm_rpi | grep -oE 'refs/heads/[^/]+' | sed 's#refs/heads/##'
-
-      - name: Clone Device Repository
-        run: |
-          echo "📥 克隆设备仓库..."
-          # 先尝试指定分支，如果失败则尝试master分支
-          if git clone --depth=1 -b ${{ github.event.inputs.ANDROID_BRANCH }} https://github.com/raspberry-vanilla/android_device_brcm_rpi4 ${DEVICE_PATH}; then
-            echo "✅ 设备仓库克隆成功，使用分支: ${{ github.event.inputs.ANDROID_BRANCH }}"
-          else
-            echo "⚠️ 指定分支不存在，尝试使用master分支..."
-            git clone --depth=1 https://github.com/raspberry-vanilla/android_device_brcm_rpi4 ${DEVICE_PATH}
-            cd ${DEVICE_PATH}
-            echo "✅ 设备仓库克隆成功，使用默认分支: $(git branch --show-current)"
-            cd ..
-          fi
-
-      - name: Determine Kernel Branch
-        run: |
-          echo "📥 确定内核分支..."
-          # 从设备仓库提取内核分支
-          if grep -q "BOARD_KERNEL_SOURCE.*android-" ${DEVICE_PATH}/BoardConfig.mk; then
-            KERNEL_BRANCH=$(grep "BOARD_KERNEL_SOURCE.*android-" ${DEVICE_PATH}/BoardConfig.mk | sed -E 's/.*android-([0-9\.]+).*/android-\1/')
-            echo "从BoardConfig.mk提取的内核分支: ${KERNEL_BRANCH}"
-          else
-            # 默认使用android-13.0分支
-            KERNEL_BRANCH="android-13.0"
-            echo "使用默认内核分支: ${KERNEL_BRANCH}"
-          fi
-          
-          # 验证内核分支是否存在
-          if git ls-remote --exit-code --heads https://github.com/raspberry-vanilla/android_kernel_brcm_rpi ${KERNEL_BRANCH}; then
-            echo "确认内核分支存在: ${KERNEL_BRANCH}"
-          else
-            echo "⚠️ 内核分支 ${KERNEL_BRANCH} 不存在，尝试使用android-13.0..."
-            if git ls-remote --exit-code --heads https://github.com/raspberry-vanilla/android_kernel_brcm_rpi android-13.0; then
-              KERNEL_BRANCH="android-13.0"
-              echo "使用内核分支: android-13.0"
-            else
-              echo "⚠️ android-13.0分支也不存在，尝试获取默认分支..."
-              KERNEL_BRANCH="master"
-              echo "使用内核默认分支: master"
-            fi
-          fi
-          
-          # 存储内核分支为环境变量供后续步骤使用
-          echo "KERNEL_BRANCH=${KERNEL_BRANCH}" >> $GITHUB_ENV
-
-      - name: Clone Kernel Repository
-        run: |
-          echo "📥 克隆内核仓库..."
-          git clone --depth=1 -b ${KERNEL_BRANCH} https://github.com/raspberry-vanilla/android_kernel_brcm_rpi ${KERNEL_PATH}
-          echo "✅ 内核仓库克隆完成"
-          
-          # 获取内核版本信息
-          cd ${KERNEL_PATH}
-          KERNEL_VERSION=$(make kernelversion)
-          echo "内核版本: ${KERNEL_VERSION}"
-
-      - name: Setup KernelSU
-        working-directory: ${{ env.KERNEL_PATH }}
-        run: |
-          echo "📥 集成KernelSU ${{ github.event.inputs.KERNELSU_VERSION }}..."
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.KERNELSU_VERSION }}
-          echo "✅ KernelSU集成完成"
-          ls -la KernelSU/
-
-      - name: Configure Kernel
-        working-directory: ${{ env.KERNEL_PATH }}
-        run: |
-          echo "⚙️ 配置内核..."
-          mkdir -p out
-          
-          # 获取内核配置文件
-          if [ -f "../${DEVICE_PATH}/BoardConfig.mk" ]; then
-            KERNEL_CONFIG=$(grep "TARGET_KERNEL_CONFIG" ../${DEVICE_PATH}/BoardConfig.mk | sed 's/.*:= //')
-            if [ -z "$KERNEL_CONFIG" ]; then
-              echo "无法从BoardConfig.mk找到内核配置，查找可用的defconfig..."
-              find arch/arm64/configs/ -name "*_defconfig" | sort
-              # 尝试使用lineageos_rpi4_defconfig或其他备选配置
-              if [ -f "arch/arm64/configs/lineageos_rpi4_defconfig" ]; then
-                KERNEL_CONFIG="lineageos_rpi4_defconfig"
-              elif [ -f "arch/arm64/configs/bcm2711_defconfig" ]; then
-                KERNEL_CONFIG="bcm2711_defconfig"
-              else
-                # 使用查找到的第一个defconfig
-                KERNEL_CONFIG=$(find arch/arm64/configs/ -name "*_defconfig" | head -1 | xargs basename)
-              fi
-            fi
-          else
-            echo "BoardConfig.mk不存在，查找可用的defconfig..."
-            find arch/arm64/configs/ -name "*_defconfig" | sort
-            # 使用查找到的第一个defconfig
-            KERNEL_CONFIG=$(find arch/arm64/configs/ -name "*_defconfig" | head -1 | xargs basename)
-          fi
-          echo "使用内核配置: ${KERNEL_CONFIG}"
-          
-          # 应用内核配置
-          make O=out ARCH=${ARCH} CROSS_COMPILE=aarch64-linux-gnu- ${KERNEL_CONFIG}
-          
-          # 启用KernelSU所需配置
-          echo "⚙️ 启用KernelSU所需配置..."
-          scripts/config --file out/.config \
-            -e CONFIG_KPROBES \
-            -e CONFIG_HAVE_KPROBES \
-            -e CONFIG_KPROBE_EVENTS \
-            -e CONFIG_KSU
-          
-          # 启用DTB支持（树莓派需要）
-          echo "⚙️ 启用设备树支持..."
-          scripts/config --file out/.config \
-            -e CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE \
-            -e CONFIG_BUILD_ARM64_DTB_OVERLAY_IMAGE
-          
-          # 禁用可能导致问题的功能
-          echo "⚙️ 禁用不必要的功能..."
-          scripts/config --file out/.config \
-            -d CONFIG_EXTRA_FIRMWARE \
-            -d CONFIG_EXTRA_FIRMWARE_DIR \
-            -d CONFIG_DEBUG_INFO \
-            -d CONFIG_LTO \
-            -d CONFIG_CC_WERROR
-          
-          # 更新配置
-          make O=out ARCH=${ARCH} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          echo "✅ 内核配置完成"
-          
-          # 简单测试是否能编译
-          make O=out ARCH=${ARCH} CROSS_COMPILE=aarch64-linux-gnu- -j1 scripts
-
-      # 后续步骤保持不变...
+    - uses: actions/checkout@v3
+      with:
+        submodules: 'recursive'
+        
+    - name: 安装依赖
+      run: |
+        sudo apt update
+        sudo apt install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+        
+    - name: 克隆KernelSU
+      run: |
+        git clone https://github.com/tiann/KernelSU
+        
+    - name: 修改内核配置
+      run: |
+        cat >> arch/arm64/configs/lineageos_rpi4_defconfig << EOF
+        CONFIG_KPROBES=y
+        CONFIG_HAVE_KPROBES=y
+        CONFIG_KPROBES_ON_FTRACE=y
+        EOF
+        
+    - name: 集成KernelSU
+      run: |
+        sed -i '/EXTRAVERSION =/a\
+        # KernelSU\
+        include $(srctree)/KernelSU/kernel/ksu.mk' Makefile
+        
+    - name: 编译内核
+      run: |
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lineageos_rpi4_defconfig
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc --all)
+        
+    - name: 上传内核文件
+      uses: actions/upload-artifact@v3
+      with:
+        name: kernel-rpi4-kernelsu
+        path: |
+          arch/arm64/boot/Image
+          arch/arm64/boot/dts/broadcom/*.dtb
