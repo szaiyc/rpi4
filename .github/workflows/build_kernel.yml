@@ -1,52 +1,145 @@
-name: 构建带KernelSU的树莓派内核
+name: 构建集成KernelSU的树莓派4内核
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: '内核版本标签'
+        required: true
+        default: '5.15.0'
+      kernelsu_version:
+        description: 'KernelSU版本'
+        required: true
+        default: 'main'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
-        
-    - name: 安装依赖
-      run: |
-        sudo apt update
-        sudo apt install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
-        
-    - name: 克隆KernelSU
-      run: |
-        git clone https://github.com/tiann/KernelSU
-        
-    - name: 修改内核配置
-      run: |
-        cat >> arch/arm64/configs/lineageos_rpi4_defconfig << EOF
-        CONFIG_KPROBES=y
-        CONFIG_HAVE_KPROBES=y
-        CONFIG_KPROBES_ON_FTRACE=y
-        EOF
-        
-    - name: 集成KernelSU
-      run: |
-        sed -i '/EXTRAVERSION =/a\
-        # KernelSU\
-        include $(srctree)/KernelSU/kernel/ksu.mk' Makefile
-        
-    - name: 编译内核
-      run: |
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- lineageos_rpi4_defconfig
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc --all)
-        
-    - name: 上传内核文件
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-rpi4-kernelsu
-        path: |
-          arch/arm64/boot/Image
-          arch/arm64/boot/dts/broadcom/*.dtb
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison python3 gcc-aarch64-linux-gnu ccache
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev gcc-multilib g++-multilib
+
+      - name: 设置缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-ccache-
+
+      - name: 配置ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "max_size = 5G" > ~/.ccache/ccache.conf
+          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+
+      - name: 克隆KernelSU
+        run: |
+          git clone --depth=1 https://github.com/tiann/KernelSU -b ${{ github.event.inputs.kernelsu_version }}
+          echo "KernelSU版本: $(cd KernelSU && git rev-parse --short HEAD)"
+
+      - name: 设置内核配置
+        run: |
+          # 启用KernelSU所需的配置
+          cat >> arch/arm64/configs/bcm2711_defconfig << EOF
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBES_ON_FTRACE=y
+          # KernelSU所需选项
+          CONFIG_MODULES=y
+          CONFIG_OVERLAY_FS=y
+          EOF
+          
+          # 在Makefile中集成KernelSU
+          sed -i '/^EXTRAVERSION =/a\\n# KernelSU\ninclude $(srctree)/KernelSU/kernel/ksu.mk' Makefile
+
+      - name: 修改内核初始化代码
+        run: |
+          # 修改init/main.c，添加KernelSU初始化
+          grep -q "ksu_kernel_init" init/main.c || cat >> init/main.c << EOF
+          
+          // KernelSU初始化
+          extern int ksu_kernel_init(void);
+          
+          static int __init ksu_module_init(void)
+          {
+              pr_info("KernelSU模块初始化\\n");
+              ksu_kernel_init();
+              return 0;
+          }
+          
+          late_initcall(ksu_module_init);
+          EOF
+
+      - name: 编译内核
+        run: |
+          mkdir -p out
+          
+          # 配置内核
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig
+          
+          # 编译内核
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
+          
+          # 创建输出目录
+          mkdir -p release/boot
+          
+          # 复制内核和设备树
+          cp out/arch/arm64/boot/Image release/boot/kernel8.img
+          cp out/arch/arm64/boot/dts/broadcom/*.dtb release/boot/
+          cp out/arch/arm64/boot/dts/overlays/*.dtb* release/boot/overlays/
+          cp out/arch/arm64/boot/dts/overlays/README release/boot/overlays/
+
+      - name: 打包模块
+        run: |
+          # 安装模块
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=release modules_install
+          
+          # 打包模块为zip文件
+          cd release
+          find . -type f -name "*.ko" -exec aarch64-linux-gnu-strip --strip-unneeded {} \;
+          zip -r ../rpi4-kernelsu-modules.zip lib/modules
+          cd ..
+
+      - name: 创建内核包
+        run: |
+          # 打包内核文件
+          cd release
+          zip -r ../rpi4-kernelsu-kernel.zip boot
+          cd ..
+          
+          # 合并为完整包
+          zip -r rpi4-kernelsu-${{ github.event.inputs.kernel_version }}.zip rpi4-kernelsu-kernel.zip rpi4-kernelsu-modules.zip
+          
+          # 创建版本说明
+          echo "树莓派4 集成KernelSU内核 - 版本 ${{ github.event.inputs.kernel_version }}" > release_notes.txt
+          echo "KernelSU版本: $(cd KernelSU && git rev-parse --short HEAD)" >> release_notes.txt
+          echo "编译时间: $(date)" >> release_notes.txt
+
+      - name: 上传内核构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi4-kernelsu-${{ github.event.inputs.kernel_version }}
+          path: |
+            rpi4-kernelsu-${{ github.event.inputs.kernel_version }}.zip
+            release_notes.txt
+
+      - name: 创建GitHub发布
+        uses: softprops/action-gh-release@v1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          files: |
+            rpi4-kernelsu-${{ github.event.inputs.kernel_version }}.zip
+            release_notes.txt
+          name: 树莓派4 KernelSU ${{ github.event.inputs.kernel_version }}
+          tag_name: ksu-${{ github.event.inputs.kernel_version }}
+          body_path: release_notes.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
