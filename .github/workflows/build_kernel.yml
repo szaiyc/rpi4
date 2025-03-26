@@ -1,0 +1,162 @@
+name: Build RPi4 Android Kernel with KernelSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_BRANCH:
+        description: '内核分支'
+        required: true
+        default: 'android-13.0'
+      KERNELSU_VERSION:
+        description: 'KernelSU版本'
+        required: true
+        default: 'v0.7.6'
+      DEVICE_BRANCH:
+        description: '设备树分支'
+        required: true
+        default: 'lineage-20.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      KERNEL_SOURCE: https://github.com/raspberry-vanilla/android_kernel_brcm_rpi
+      DEVICE_SOURCE: https://github.com/raspberry-vanilla/android_device_brcm_rpi4
+      KERNEL_CONFIG: lineageos_rpi4_defconfig
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+      CLANG_TRIPLE: aarch64-linux-gnu-
+
+    steps:
+      - name: Setup Build Environment
+        run: |
+          echo "🔧 安装依赖包..."
+          sudo apt-get update
+          sudo apt-get install -y \
+            git ccache automake flex lzop bison \
+            gperf build-essential zip curl zlib1g-dev \
+            g++-multilib gcc-multilib libxml2-utils \
+            bzip2 libbz2-dev libbz2-1.0 libghc-bzlib-dev \
+            squashfs-tools pngcrush schedtool dpkg-dev \
+            liblz4-tool make optipng maven libssl-dev \
+            pwgen libswitch-perl policycoreutils \
+            minicom libxml-sax-base-perl libxml-simple-perl \
+            bc libc6-dev-i386 lib32ncurses5-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev \
+            libgl1-mesa-dev xsltproc unzip device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clone Kernel Source
+        run: |
+          echo "📥 克隆内核源码..."
+          git clone --depth=1 -b ${{ github.event.inputs.KERNEL_BRANCH }} ${KERNEL_SOURCE} kernel_source
+          cd kernel_source
+          echo "✅ 内核源码版本信息："
+          git log -1 --oneline
+
+      - name: Clone Device Tree
+        run: |
+          echo "📥 克隆设备树..."
+          git clone --depth=1 -b ${{ github.event.inputs.DEVICE_BRANCH }} ${DEVICE_SOURCE} device_tree
+          echo "✅ 设备树克隆完成"
+
+      - name: Setup KernelSU
+        working-directory: kernel_source
+        run: |
+          echo "📥 集成KernelSU ${{ github.event.inputs.KERNELSU_VERSION }}..."
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.KERNELSU_VERSION }}
+          echo "✅ KernelSU集成完成"
+
+      - name: Configure Kernel
+        working-directory: kernel_source
+        run: |
+          echo "⚙️ 配置内核..."
+          mkdir -p out
+          
+          # 应用基础配置
+          make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} ${KERNEL_CONFIG}
+          
+          # 启用KernelSU必需的配置
+          scripts/config --file out/.config \
+            -e CONFIG_KPROBES \
+            -e CONFIG_HAVE_KPROBES \
+            -e CONFIG_KPROBE_EVENTS \
+            -e CONFIG_MODULES \
+            -e CONFIG_IKCONFIG \
+            -e CONFIG_IKCONFIG_PROC \
+            -e CONFIG_FUNCTION_TRACER \
+            -e CONFIG_FUNCTION_GRAPH_TRACER \
+            -e CONFIG_KPROBES_ON_FTRACE \
+            -e CONFIG_OVERLAY_FS \
+            -e CONFIG_KSU
+          
+          # 更新配置
+          make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
+          
+          echo "✅ 内核配置完成"
+
+      - name: Build Kernel
+        working-directory: kernel_source
+        run: |
+          echo "🔨 编译内核..."
+          make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} -j$(nproc --all) 2>&1 | tee build.log
+          
+          if [ -f "out/arch/${ARCH}/boot/Image.gz" ]; then
+            echo "✅ 内核编译成功"
+          else
+            echo "❌ 内核编译失败"
+            exit 1
+          fi
+
+      - name: Package Kernel
+        run: |
+          echo "📦 打包内核文件..."
+          mkdir -p release
+          
+          # 复制内核文件
+          cp kernel_source/out/arch/${ARCH}/boot/Image.gz release/
+          cp kernel_source/out/arch/${ARCH}/boot/dts/broadcom/*.dtb release/
+          
+          # 创建版本信息文件
+          cat > release/version.txt << EOF
+          Kernel Version: ${{ github.event.inputs.KERNEL_BRANCH }}
+          KernelSU Version: ${{ github.event.inputs.KERNELSU_VERSION }}
+          Build Date: $(date '+%Y-%m-%d %H:%M:%S')
+          EOF
+          
+          # 打包
+          cd release
+          zip -r ../kernel-su-rpi4.zip *
+          cd ..
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: kernel-su-rpi4
+          path: |
+            kernel-su-rpi4.zip
+            kernel_source/build.log
+          retention-days: 7
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: success()
+        with:
+          files: kernel-su-rpi4.zip
+          name: KernelSU for RPi4 - ${{ github.event.inputs.KERNELSU_VERSION }}
+          tag_name: kernelsu-${{ github.run_number }}
+          body: |
+            树莓派4 KernelSU 内核
+            
+            - 内核分支: ${{ github.event.inputs.KERNEL_BRANCH }}
+            - KernelSU版本: ${{ github.event.inputs.KERNELSU_VERSION }}
+            - 设备树分支: ${{ github.event.inputs.DEVICE_BRANCH }}
+            
+            ### 安装说明
+            1. 解压zip包
+            2. 替换boot分区中的kernel8.img
+            3. 安装KernelSU Manager应用
+            4. 重启设备
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
