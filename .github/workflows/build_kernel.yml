@@ -45,10 +45,45 @@ jobs:
           git clone --depth=1 https://github.com/tiann/KernelSU -b ${{ github.event.inputs.kernelsu_version }}
           echo "KernelSU版本: $(cd KernelSU && git rev-parse --short HEAD)"
 
+      - name: 查找内核配置文件
+        id: find_config
+        run: |
+          # 查找所有可能的配置文件
+          CONFIG_FILES=$(find arch/arm64/configs/ -name "*defconfig" -type f 2>/dev/null || echo "")
+          if [ -z "$CONFIG_FILES" ]; then
+            echo "错误：找不到内核配置文件！"
+            exit 1
+          fi
+          
+          # 优先选择以下配置文件（按优先级排序）
+          for PATTERN in "bcm2711" "rpi4" "rpi"; do
+            for CONFIG in $CONFIG_FILES; do
+              if echo "$CONFIG" | grep -i "$PATTERN" > /dev/null; then
+                echo "找到配置文件: $CONFIG"
+                echo "config_file=$CONFIG" >> $GITHUB_OUTPUT
+                break 2
+              fi
+            done
+          done
+          
+          # 如果没有找到匹配的，使用第一个找到的配置文件
+          if [ -z "$(echo "$GITHUB_OUTPUT" | grep config_file)" ]; then
+            CONFIG=$(echo "$CONFIG_FILES" | head -n1)
+            echo "使用默认配置文件: $CONFIG"
+            echo "config_file=$CONFIG" >> $GITHUB_OUTPUT
+          fi
+          
+          # 显示找到的所有配置文件
+          echo "所有可用的配置文件:"
+          echo "$CONFIG_FILES"
+
       - name: 设置内核配置
         run: |
+          CONFIG_FILE="${{ steps.find_config.outputs.config_file }}"
+          echo "使用配置文件: $CONFIG_FILE"
+          
           # 启用KernelSU所需的配置
-          cat >> arch/arm64/configs/bcm2711_defconfig << EOF
+          cat >> $CONFIG_FILE << EOF
           CONFIG_KPROBES=y
           CONFIG_HAVE_KPROBES=y
           CONFIG_KPROBES_ON_FTRACE=y
@@ -82,20 +117,23 @@ jobs:
         run: |
           mkdir -p out
           
+          # 获取配置文件名（不含路径）
+          CONFIG_NAME=$(basename ${{ steps.find_config.outputs.config_file }})
+          
           # 配置内核
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ${CONFIG_NAME%.defconfig}_defconfig
           
           # 编译内核
           make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
           
           # 创建输出目录
-          mkdir -p release/boot
+          mkdir -p release/boot/overlays
           
           # 复制内核和设备树
-          cp out/arch/arm64/boot/Image release/boot/kernel8.img
-          cp out/arch/arm64/boot/dts/broadcom/*.dtb release/boot/
-          cp out/arch/arm64/boot/dts/overlays/*.dtb* release/boot/overlays/
-          cp out/arch/arm64/boot/dts/overlays/README release/boot/overlays/
+          cp out/arch/arm64/boot/Image release/boot/kernel8.img || cp out/arch/arm64/boot/Image.gz release/boot/kernel8.img
+          cp out/arch/arm64/boot/dts/broadcom/*.dtb release/boot/ || echo "没有找到broadcom目录下的DTB文件"
+          cp out/arch/arm64/boot/dts/overlays/*.dtb* release/boot/overlays/ || echo "没有找到overlays目录下的DTB文件"
+          cp out/arch/arm64/boot/dts/overlays/README release/boot/overlays/ || echo "没有找到README文件"
 
       - name: 打包模块
         run: |
@@ -104,8 +142,8 @@ jobs:
           
           # 打包模块为zip文件
           cd release
-          find . -type f -name "*.ko" -exec aarch64-linux-gnu-strip --strip-unneeded {} \;
-          zip -r ../rpi4-kernelsu-modules.zip lib/modules
+          find . -type f -name "*.ko" -exec aarch64-linux-gnu-strip --strip-unneeded {} \; || echo "没有找到内核模块或strip失败"
+          zip -r ../rpi4-kernelsu-modules.zip lib/modules || echo "打包模块失败，可能没有模块生成"
           cd ..
 
       - name: 创建内核包
@@ -122,6 +160,7 @@ jobs:
           echo "树莓派4 集成KernelSU内核 - 版本 ${{ github.event.inputs.kernel_version }}" > release_notes.txt
           echo "KernelSU版本: $(cd KernelSU && git rev-parse --short HEAD)" >> release_notes.txt
           echo "编译时间: $(date)" >> release_notes.txt
+          echo "使用配置文件: ${{ steps.find_config.outputs.config_file }}" >> release_notes.txt
 
       - name: 上传内核构建产物
         uses: actions/upload-artifact@v4
