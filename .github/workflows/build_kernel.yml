@@ -11,7 +11,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         submodules: 'recursive'
         
@@ -44,7 +44,7 @@ jobs:
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc --all)
         
     - name: 上传内核文件
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: kernel-rpi4-kernelsu
         path: |
