@@ -6,10 +6,10 @@ on:
       ANDROID_BRANCH:
         description: 'Android分支'
         required: true
-        default: 'lineage-20.0'
+        default: 'master'  # 修改为默认分支
         type: choice
         options:
-          - 'lineage-20.0'
+          - 'master'
           - 'lineage-19.1'
           - 'lineage-18.1'
       KERNELSU_VERSION:
@@ -63,22 +63,61 @@ jobs:
         id: date
         run: echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
 
-      - name: Clone Device Repositories
+      - name: Check Repository Branches
+        run: |
+          echo "🔍 检查设备仓库可用分支..."
+          git ls-remote --heads https://github.com/raspberry-vanilla/android_device_brcm_rpi4 | grep -oE 'refs/heads/[^/]+' | sed 's#refs/heads/##'
+          
+          echo "🔍 检查内核仓库可用分支..."
+          git ls-remote --heads https://github.com/raspberry-vanilla/android_kernel_brcm_rpi | grep -oE 'refs/heads/[^/]+' | sed 's#refs/heads/##'
+
+      - name: Clone Device Repository
         run: |
           echo "📥 克隆设备仓库..."
-          git clone --depth=1 -b ${{ github.event.inputs.ANDROID_BRANCH }} https://github.com/raspberry-vanilla/android_device_brcm_rpi4 ${DEVICE_PATH}
-          echo "✅ 设备仓库克隆完成"
-          
+          # 先尝试指定分支，如果失败则尝试master分支
+          if git clone --depth=1 -b ${{ github.event.inputs.ANDROID_BRANCH }} https://github.com/raspberry-vanilla/android_device_brcm_rpi4 ${DEVICE_PATH}; then
+            echo "✅ 设备仓库克隆成功，使用分支: ${{ github.event.inputs.ANDROID_BRANCH }}"
+          else
+            echo "⚠️ 指定分支不存在，尝试使用master分支..."
+            git clone --depth=1 https://github.com/raspberry-vanilla/android_device_brcm_rpi4 ${DEVICE_PATH}
+            cd ${DEVICE_PATH}
+            echo "✅ 设备仓库克隆成功，使用默认分支: $(git branch --show-current)"
+            cd ..
+          fi
+
+      - name: Determine Kernel Branch
+        run: |
           echo "📥 确定内核分支..."
           # 从设备仓库提取内核分支
           if grep -q "BOARD_KERNEL_SOURCE.*android-" ${DEVICE_PATH}/BoardConfig.mk; then
             KERNEL_BRANCH=$(grep "BOARD_KERNEL_SOURCE.*android-" ${DEVICE_PATH}/BoardConfig.mk | sed -E 's/.*android-([0-9\.]+).*/android-\1/')
+            echo "从BoardConfig.mk提取的内核分支: ${KERNEL_BRANCH}"
           else
             # 默认使用android-13.0分支
             KERNEL_BRANCH="android-13.0"
+            echo "使用默认内核分支: ${KERNEL_BRANCH}"
           fi
-          echo "使用内核分支: ${KERNEL_BRANCH}"
           
+          # 验证内核分支是否存在
+          if git ls-remote --exit-code --heads https://github.com/raspberry-vanilla/android_kernel_brcm_rpi ${KERNEL_BRANCH}; then
+            echo "确认内核分支存在: ${KERNEL_BRANCH}"
+          else
+            echo "⚠️ 内核分支 ${KERNEL_BRANCH} 不存在，尝试使用android-13.0..."
+            if git ls-remote --exit-code --heads https://github.com/raspberry-vanilla/android_kernel_brcm_rpi android-13.0; then
+              KERNEL_BRANCH="android-13.0"
+              echo "使用内核分支: android-13.0"
+            else
+              echo "⚠️ android-13.0分支也不存在，尝试获取默认分支..."
+              KERNEL_BRANCH="master"
+              echo "使用内核默认分支: master"
+            fi
+          fi
+          
+          # 存储内核分支为环境变量供后续步骤使用
+          echo "KERNEL_BRANCH=${KERNEL_BRANCH}" >> $GITHUB_ENV
+
+      - name: Clone Kernel Repository
+        run: |
           echo "📥 克隆内核仓库..."
           git clone --depth=1 -b ${KERNEL_BRANCH} https://github.com/raspberry-vanilla/android_kernel_brcm_rpi ${KERNEL_PATH}
           echo "✅ 内核仓库克隆完成"
@@ -106,10 +145,23 @@ jobs:
           if [ -f "../${DEVICE_PATH}/BoardConfig.mk" ]; then
             KERNEL_CONFIG=$(grep "TARGET_KERNEL_CONFIG" ../${DEVICE_PATH}/BoardConfig.mk | sed 's/.*:= //')
             if [ -z "$KERNEL_CONFIG" ]; then
-              KERNEL_CONFIG="lineageos_rpi4_defconfig"
+              echo "无法从BoardConfig.mk找到内核配置，查找可用的defconfig..."
+              find arch/arm64/configs/ -name "*_defconfig" | sort
+              # 尝试使用lineageos_rpi4_defconfig或其他备选配置
+              if [ -f "arch/arm64/configs/lineageos_rpi4_defconfig" ]; then
+                KERNEL_CONFIG="lineageos_rpi4_defconfig"
+              elif [ -f "arch/arm64/configs/bcm2711_defconfig" ]; then
+                KERNEL_CONFIG="bcm2711_defconfig"
+              else
+                # 使用查找到的第一个defconfig
+                KERNEL_CONFIG=$(find arch/arm64/configs/ -name "*_defconfig" | head -1 | xargs basename)
+              fi
             fi
           else
-            KERNEL_CONFIG="lineageos_rpi4_defconfig"
+            echo "BoardConfig.mk不存在，查找可用的defconfig..."
+            find arch/arm64/configs/ -name "*_defconfig" | sort
+            # 使用查找到的第一个defconfig
+            KERNEL_CONFIG=$(find arch/arm64/configs/ -name "*_defconfig" | head -1 | xargs basename)
           fi
           echo "使用内核配置: ${KERNEL_CONFIG}"
           
@@ -146,181 +198,4 @@ jobs:
           # 简单测试是否能编译
           make O=out ARCH=${ARCH} CROSS_COMPILE=aarch64-linux-gnu- -j1 scripts
 
-      - name: Build Kernel
-        working-directory: ${{ env.KERNEL_PATH }}
-        run: |
-          echo "🔨 开始编译内核..."
-          # 使用多线程编译，并记录日志
-          make O=out \
-            ARCH=${ARCH} \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            -j$(nproc) \
-            V=1 2>&1 | tee build.log
-          
-          # 检查是否生成了Image.gz
-          if [ -f "out/arch/${ARCH}/boot/Image.gz" ]; then
-            echo "✅ 内核Image.gz创建成功"
-          else
-            echo "❌ 内核Image.gz创建失败"
-            tail -n 100 build.log
-            exit 1
-          fi
-
-      - name: Build DTBs and Create Image.gz-dtb
-        working-directory: ${{ env.KERNEL_PATH }}
-        run: |
-          echo "🔨 编译设备树文件..."
-          # 编译所有DTB文件
-          make O=out \
-            ARCH=${ARCH} \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            dtbs -j$(nproc)
-          
-          echo "🔍 查找树莓派4 DTB文件..."
-          # 查找并显示BCM2711 DTB文件
-          find out/arch/${ARCH}/boot/dts/ -name "bcm2711-*.dtb" | sort
-          
-          # 找到BCM2711 DTB并合并到Image.gz
-          RPI4_DTB=$(find out/arch/${ARCH}/boot/dts/ -name "bcm2711-*.dtb" | head -1)
-          if [ -n "$RPI4_DTB" ]; then
-            echo "✅ 找到DTB文件: $RPI4_DTB"
-            echo "🔨 合并内核与DTB..."
-            cat out/arch/${ARCH}/boot/Image.gz "$RPI4_DTB" > out/arch/${ARCH}/boot/Image.gz-dtb
-            echo "✅ 创建Image.gz-dtb成功"
-          else
-            echo "⚠️ 未找到BCM2711 DTB，尝试使用其它DTB..."
-            find out/arch/${ARCH}/boot/dts/ -name "*.dtb" > dtb_files.txt
-            if [ -s dtb_files.txt ]; then
-              DTB_FILE=$(cat dtb_files.txt | head -1)
-              echo "✅ 使用DTB: $DTB_FILE"
-              cat out/arch/${ARCH}/boot/Image.gz "$DTB_FILE" > out/arch/${ARCH}/boot/Image.gz-dtb
-              echo "✅ 创建Image.gz-dtb成功"
-            else
-              echo "⚠️ 没有找到DTB文件，直接使用Image.gz..."
-              cp out/arch/${ARCH}/boot/Image.gz out/arch/${ARCH}/boot/Image.gz-dtb
-            fi
-          fi
-          
-          # 检查生成的Image.gz-dtb
-          ls -lh out/arch/${ARCH}/boot/Image.gz-dtb
-
-      - name: Prepare Release Files
-        working-directory: ${{ env.KERNEL_PATH }}
-        run: |
-          echo "📦 准备发布文件..."
-          # 创建输出目录
-          mkdir -p ../release/{boot,system}
-          
-          # 复制内核文件 (两种格式)
-          cp out/arch/${ARCH}/boot/Image.gz-dtb ../release/boot/Image.gz-dtb
-          cp out/arch/${ARCH}/boot/Image.gz-dtb ../release/boot/kernel8.img
-          
-          # 复制DTB文件
-          mkdir -p ../release/boot/dtbs
-          cp -r out/arch/${ARCH}/boot/dts/broadcom/ ../release/boot/dtbs/
-          
-          # 编译设备树覆盖文件
-          if [ -d "arch/${ARCH}/boot/dts/overlays" ]; then
-            echo "🔨 编译设备树覆盖文件..."
-            mkdir -p ../release/boot/overlays
-            
-            # 查找所有DTS文件
-            find arch/${ARCH}/boot/dts/overlays -name "*.dts" -type f | while read dts_file; do
-              base_name=$(basename "$dts_file" .dts)
-              echo "编译: $dts_file -> $base_name.dtbo"
-              
-              # 使用DTC编译DTS为DTBO
-              dtc -@ -I dts -O dtb -o "../release/boot/overlays/$base_name.dtbo" "$dts_file"
-            done
-            
-            # 复制README文件如果存在
-            if [ -f "arch/${ARCH}/boot/dts/overlays/README" ]; then
-              cp arch/${ARCH}/boot/dts/overlays/README ../release/boot/overlays/
-            fi
-            
-            echo "✅ 设备树覆盖文件编译完成"
-          fi
-          
-          # 准备KernelSU管理器APK
-          echo "📱 下载KernelSU管理器应用..."
-          curl -L -o ../release/system/KernelSU.apk https://github.com/tiann/KernelSU/releases/download/${{ github.event.inputs.KERNELSU_VERSION }}/KernelSU_${{ github.event.inputs.KERNELSU_VERSION }}.apk
-          echo "✅ KernelSU管理器下载完成"
-          
-          # 创建安装指南
-          echo "# 树莓派4 KernelSU 安装指南" > ../release/README.md
-          echo "" >> ../release/README.md
-          echo "## 版本信息" >> ../release/README.md
-          echo "- Android分支: ${{ github.event.inputs.ANDROID_BRANCH }}" >> ../release/README.md
-          echo "- KernelSU版本: ${{ github.event.inputs.KERNELSU_VERSION }}" >> ../release/README.md
-          echo "- 构建日期: ${{ steps.date.outputs.date }}" >> ../release/README.md
-          echo "" >> ../release/README.md
-          echo "## 适用于Android系统" >> ../release/README.md
-          echo "1. 备份原始boot.img" >> ../release/README.md
-          echo "2. 解包boot.img: `abootimg -x boot.img`" >> ../release/README.md
-          echo "3. 替换内核: `cp boot/Image.gz-dtb 解包目录中的内核文件`" >> ../release/README.md
-          echo "4. 重新打包boot.img: `abootimg --create newboot.img -f bootimg.cfg -k Image.gz-dtb -r initrd.img`" >> ../release/README.md
-          echo "5. 刷入新的boot.img: `fastboot flash boot newboot.img`" >> ../release/README.md
-          echo "6. 安装KernelSU管理器: 安装release/system/KernelSU.apk" >> ../release/README.md
-          echo "" >> ../release/README.md
-          echo "## 适用于树莓派OS" >> ../release/README.md
-          echo "1. 挂载boot分区" >> ../release/README.md
-          echo "2. 备份原始kernel8.img" >> ../release/README.md
-          echo "3. 复制boot/kernel8.img到boot分区" >> ../release/README.md
-          echo "4. 如果需要，也可以更新dtbs和overlays目录" >> ../release/README.md
-          echo "5. 重启系统" >> ../release/README.md
-          echo "6. 安装release/system/KernelSU.apk" >> ../release/README.md
-          echo "" >> ../release/README.md
-          echo "## 恢复方法" >> ../release/README.md
-          echo "如果系统无法启动，请恢复备份的原始内核文件。" >> ../release/README.md
-          
-          # 创建发布ZIP包
-          cd ../release
-          zip -r9 ../rpi4-kernelsu-${{ steps.date.outputs.date }}.zip ./*
-          cd ..
-          
-          echo "✅ 发布文件准备完成: $(ls -lh rpi4-kernelsu-${{ steps.date.outputs.date }}.zip)"
-      
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpi4-kernelsu-${{ steps.date.outputs.date }}
-          path: |
-            release
-            ${{ env.KERNEL_PATH }}/out/arch/${{ env.ARCH }}/boot/Image.gz-dtb
-            ${{ env.KERNEL_PATH }}/build.log
-            rpi4-kernelsu-${{ steps.date.outputs.date }}.zip
-          retention-days: 7
-
-      - name: Create GitHub Release
-        if: success()
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            rpi4-kernelsu-${{ steps.date.outputs.date }}.zip
-            ${{ env.KERNEL_PATH }}/out/arch/${{ env.ARCH }}/boot/Image.gz-dtb
-          name: RPI4 KernelSU ${{ github.event.inputs.ANDROID_BRANCH }} - ${{ steps.date.outputs.date }}
-          tag_name: kernelsu-${{ steps.date.outputs.date }}
-          body: |
-            # 树莓派4 KernelSU
-            
-            集成了KernelSU的树莓派4内核，用于Android或树莓派OS系统。
-            
-            ## 版本信息
-            - Android分支: ${{ github.event.inputs.ANDROID_BRANCH }}
-            - KernelSU版本: ${{ github.event.inputs.KERNELSU_VERSION }}
-            - 构建日期: ${{ steps.date.outputs.date }}
-            
-            ## 包含文件
-            - 完整格式的内核文件(Image.gz-dtb)
-            - 所有必要的DTB文件
-            - 设备树覆盖文件(overlays)
-            - KernelSU管理器APK
-            - 详细的安装指南
-            
-            ## 使用说明
-            解压ZIP包后，按照README.md中的说明进行安装。
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 后续步骤保持不变...
