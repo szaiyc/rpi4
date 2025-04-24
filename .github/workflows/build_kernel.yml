@@ -22,6 +22,8 @@ jobs:
           sudo apt-get install -y bc bison flex libssl-dev make
           sudo apt-get install -y libncurses5-dev libncursesw5-dev
           sudo apt-get install -y crossbuild-essential-arm64
+          # 添加额外的依赖
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: 获取内核源码
         run: |
@@ -39,7 +41,12 @@ jobs:
           KERNEL=kernel8
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig
           
-          # 确保启用KernelSU必要选项
+          # 修改配置以解决IIO模块问题
+          sed -i 's/CONFIG_IIO=m/CONFIG_IIO=y/' .config
+          sed -i 's/CONFIG_IIO_BUFFER=m/CONFIG_IIO_BUFFER=y/' .config
+          sed -i 's/CONFIG_IIO_TRIGGERED_BUFFER=m/CONFIG_IIO_TRIGGERED_BUFFER=y/' .config
+          
+          # KernelSU必要选项
           sed -i 's/CONFIG_MODULE_SIG_FORCE=y/# CONFIG_MODULE_SIG_FORCE is not set/' .config
           sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' .config
           echo "CONFIG_HAVE_KPROBES=y" >> .config
@@ -47,12 +54,17 @@ jobs:
           echo "CONFIG_MODULES=y" >> .config
           echo "CONFIG_MODULE_FORCE_LOAD=y" >> .config
           
+          # 确保配置生效
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          
       - name: 编译内核
         run: |
           cd linux
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image modules dtbs -j$(nproc)
+          # 添加详细输出以便调试
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image modules dtbs -j$(nproc) V=1
           
       - name: 准备输出文件
+        if: success()
         run: |
           mkdir -p output/boot
           mkdir -p output/boot/overlays
@@ -61,7 +73,7 @@ jobs:
           cp linux/arch/arm64/boot/dts/overlays/*.dtb* output/boot/overlays/
           cp linux/arch/arm64/boot/dts/overlays/README output/boot/overlays/
           
-          # 创建简单的安装说明
+          # 创建安装说明
           echo "# 安装说明" > output/README.md
           echo "1. 将SD卡的boot分区挂载后，备份原始kernel8.img" >> output/README.md
           echo "2. 复制kernel8_new.img和dtb文件到boot分区" >> output/README.md
@@ -69,7 +81,15 @@ jobs:
           echo "4. 在cmdline.txt中添加: androidboot.selinux=permissive" >> output/README.md
           
       - name: 上传编译结果
-        uses: actions/upload-artifact@v4
+        if: success()
+        uses: actions/upload-artifact@v3
         with:
           name: raspberry-pi-4b-kernelsu-${{ github.event.inputs.kernel_version }}
           path: output/
+
+      - name: 上传编译日志（如果失败）
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: compilation-logs
+          path: linux/.config
