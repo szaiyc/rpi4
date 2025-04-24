@@ -1,55 +1,75 @@
-name: Build Raspberry Pi Kernel with KernelSU
+name: 树莓派4B-KernelSU编译
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: '内核版本分支'
+        required: true
+        default: 'rpi-5.15.y'
+        type: choice
+        options:
+          - 'rpi-5.15.y'
+          - 'rpi-6.1.y'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: arm64v8/ubuntu:22.04  # 使用 ARM64 的 Ubuntu 容器
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: 安装依赖项
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev make
+          sudo apt-get install -y libncurses5-dev libncursesw5-dev
+          sudo apt-get install -y crossbuild-essential-arm64
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev make
-        sudo apt-get install -y libncurses5-dev libncursesw5-dev
-        sudo apt-get install -y crossbuild-essential-arm64
-        sudo apt-get install -y raspberrypi-kernel-headers
-
-    - name: Clone Raspberry Pi Linux Kernel
-      run: |
-        git clone --depth=1 --branch rpi-6.1.y https://github.com/raspberrypi/linux
-        cd linux
-        export KERNEL=kernel8
-
-    - name: Configure Kernel for KernelSU
-      run: |
-        cd linux
-        # 使用默认配置（如 bcm2711_defconfig）
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig
-        # 启用 KernelSU 必要配置
-        echo "CONFIG_KPROBES=y" >> .config
-        echo "CONFIG_MODULES=y" >> .config
-        echo "CONFIG_MODULE_FORCE_LOAD=y" >> .config
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- oldconfig
-
-    - name: Build Kernel
-      run: |
-        cd linux
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image modules dtbs -j$(nproc)
-
-    - name: Archive Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-artifacts
-        path: |
-          linux/arch/arm64/boot/Image
-          linux/arch/arm64/boot/dts/broadcom/*.dtb
+      - name: 获取内核源码
+        run: |
+          git clone --depth=1 --branch ${{ github.event.inputs.kernel_version }} https://github.com/raspberrypi/linux
+          cd linux
+          
+      - name: 应用KernelSU补丁
+        run: |
+          cd linux
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          
+      - name: 配置内核
+        run: |
+          cd linux
+          KERNEL=kernel8
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig
+          
+          # 确保启用KernelSU必要选项
+          sed -i 's/CONFIG_MODULE_SIG_FORCE=y/# CONFIG_MODULE_SIG_FORCE is not set/' .config
+          sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' .config
+          echo "CONFIG_HAVE_KPROBES=y" >> .config
+          echo "CONFIG_KPROBE_EVENTS=y" >> .config
+          echo "CONFIG_MODULES=y" >> .config
+          echo "CONFIG_MODULE_FORCE_LOAD=y" >> .config
+          
+      - name: 编译内核
+        run: |
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image modules dtbs -j$(nproc)
+          
+      - name: 准备输出文件
+        run: |
+          mkdir -p output/boot
+          mkdir -p output/boot/overlays
+          cp linux/arch/arm64/boot/Image output/boot/kernel8_new.img
+          cp linux/arch/arm64/boot/dts/broadcom/*.dtb output/boot/
+          cp linux/arch/arm64/boot/dts/overlays/*.dtb* output/boot/overlays/
+          cp linux/arch/arm64/boot/dts/overlays/README output/boot/overlays/
+          
+          # 创建简单的安装说明
+          echo "# 安装说明" > output/README.md
+          echo "1. 将SD卡的boot分区挂载后，备份原始kernel8.img" >> output/README.md
+          echo "2. 复制kernel8_new.img和dtb文件到boot分区" >> output/README.md
+          echo "3. 在config.txt中添加: kernel=kernel8_new.img" >> output/README.md
+          echo "4. 在cmdline.txt中添加: androidboot.selinux=permissive" >> output/README.md
+          
+      - name: 上传编译结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: raspberry-pi-4b-kernelsu-${{ github.event.inputs.kernel_version }}
+          path: output/
