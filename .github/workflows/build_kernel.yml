@@ -16,53 +16,105 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: 检查工作目录
+        run: |
+          pwd
+          ls -la
+
       - name: 安装依赖项
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev make
           sudo apt-get install -y libncurses5-dev libncursesw5-dev
           sudo apt-get install -y crossbuild-essential-arm64
-          # 添加额外的依赖
           sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: 获取内核源码
         run: |
           git clone --depth=1 --branch ${{ github.event.inputs.kernel_version }} https://github.com/raspberrypi/linux
           cd linux
+          # 验证源码是否成功克隆
+          if [ ! -d ".git" ]; then
+            echo "错误：内核源码克隆失败"
+            exit 1
+          fi
+          ls -la
           
       - name: 应用KernelSU补丁
         run: |
           cd linux
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          # 验证补丁是否成功应用
+          if [ $? -ne 0 ]; then
+            echo "错误：KernelSU补丁应用失败"
+            exit 1
+          fi
           
       - name: 配置内核
         run: |
           cd linux
-          KERNEL=kernel8
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_defconfig
+          # 显示当前目录内容
+          pwd
+          ls -la
           
-          # 修改配置以解决IIO模块问题
-          sed -i 's/CONFIG_IIO=m/CONFIG_IIO=y/' .config
-          sed -i 's/CONFIG_IIO_BUFFER=m/CONFIG_IIO_BUFFER=y/' .config
-          sed -i 's/CONFIG_IIO_TRIGGERED_BUFFER=m/CONFIG_IIO_TRIGGERED_BUFFER=y/' .config
+          # 设置环境变量
+          export KERNEL=kernel8
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
           
-          # KernelSU必要选项
+          # 创建初始配置
+          make bcm2711_defconfig
+          
+          # 验证配置文件是否生成
+          if [ ! -f ".config" ]; then
+            echo "错误：配置文件未生成"
+            exit 1
+          fi
+          
+          # 修改必要的配置选项
           sed -i 's/CONFIG_MODULE_SIG_FORCE=y/# CONFIG_MODULE_SIG_FORCE is not set/' .config
-          sed -i 's/# CONFIG_KPROBES is not set/CONFIG_KPROBES=y/' .config
+          echo "CONFIG_KPROBES=y" >> .config
           echo "CONFIG_HAVE_KPROBES=y" >> .config
           echo "CONFIG_KPROBE_EVENTS=y" >> .config
           echo "CONFIG_MODULES=y" >> .config
           echo "CONFIG_MODULE_FORCE_LOAD=y" >> .config
           
-          # 确保配置生效
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          # 更新配置
+          make olddefconfig
+          
+          # 显示最终配置
+          echo "最终内核配置："
+          cat .config
           
       - name: 编译内核
         run: |
           cd linux
-          # 添加详细输出以便调试
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image modules dtbs -j$(nproc) V=1
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
           
+          # 清理之前的编译文件
+          make clean
+          
+          # 编译内核（添加详细输出）
+          make Image modules dtbs -j$(nproc) V=1 2>&1 | tee build.log
+          
+          # 检查编译结果
+          if [ ! -f "arch/arm64/boot/Image" ]; then
+            echo "错误：内核编译失败"
+            echo "构建日志最后100行："
+            tail -n 100 build.log
+            exit 1
+          fi
+          
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            linux/build.log
+            linux/.config
+            
       - name: 准备输出文件
         if: success()
         run: |
@@ -73,23 +125,9 @@ jobs:
           cp linux/arch/arm64/boot/dts/overlays/*.dtb* output/boot/overlays/
           cp linux/arch/arm64/boot/dts/overlays/README output/boot/overlays/
           
-          # 创建安装说明
-          echo "# 安装说明" > output/README.md
-          echo "1. 将SD卡的boot分区挂载后，备份原始kernel8.img" >> output/README.md
-          echo "2. 复制kernel8_new.img和dtb文件到boot分区" >> output/README.md
-          echo "3. 在config.txt中添加: kernel=kernel8_new.img" >> output/README.md
-          echo "4. 在cmdline.txt中添加: androidboot.selinux=permissive" >> output/README.md
-          
       - name: 上传编译结果
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: raspberry-pi-4b-kernelsu-${{ github.event.inputs.kernel_version }}
           path: output/
-
-      - name: 上传编译日志（如果失败）
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: compilation-logs
-          path: linux/.config
