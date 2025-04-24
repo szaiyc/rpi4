@@ -82,14 +82,14 @@ jobs:
           
       - name: 上传编译结果
         if: success()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: raspberry-pi-4b-kernelsu-${{ github.event.inputs.kernel_version }}
           path: output/
 
       - name: 上传编译日志（如果失败）
         if: failure()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: compilation-logs
           path: linux/.config
